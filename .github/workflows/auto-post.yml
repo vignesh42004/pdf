@@ -1,0 +1,58 @@
+name: Auto Post PDF to Blogger
+
+on:
+  push:
+    paths:
+      - '**.pdf'
+
+jobs:
+  post-to-blogger:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 2
+
+      - name: Get PDF filename
+        id: pdf
+        run: |
+          PDF_FILE=$(git diff --name-only HEAD~1 HEAD | grep -i '.pdf$' | head -1)
+          if [ -z "$PDF_FILE" ]; then
+            echo "No PDF found"
+            exit 0
+          fi
+          PDF_NAME=$(basename "$PDF_FILE" .pdf)
+          PDF_URL="https://raw.githubusercontent.com/${{ github.repository }}/main/$PDF_FILE"
+          PDF_URL_ENCODED=$(echo "$PDF_URL" | sed 's/ /%20/g')
+          echo "file=$PDF_FILE" >> $GITHUB_OUTPUT
+          echo "name=$PDF_NAME" >> $GITHUB_OUTPUT
+          echo "url=$PDF_URL_ENCODED" >> $GITHUB_OUTPUT
+
+      - name: Get Access Token
+        if: steps.pdf.outputs.file != ''
+        id: token
+        run: |
+          RESPONSE=$(curl -s -X POST https://oauth2.googleapis.com/token \
+            -d "client_id=${{ secrets.BLOGGER_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.BLOGGER_CLIENT_SECRET }}" \
+            -d "refresh_token=${{ secrets.BLOGGER_REFRESH_TOKEN }}" \
+            -d "grant_type=refresh_token")
+          ACCESS_TOKEN=$(echo $RESPONSE | jq -r '.access_token')
+          echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Create Blogger Post
+        if: steps.pdf.outputs.file != ''
+        run: |
+          POST_CONTENT='<style>.modern-pdf-wrap{position:relative;max-width:900px;margin:20px auto;border-radius:12px;overflow:hidden;box-shadow:0 5px 25px rgba(0,0,0,0.2);width:95%}.modern-pdf-frame{width:100%;height:620px;border:none;display:block}.floating-controls{position:absolute;top:15px;right:15px;z-index:100;display:flex;gap:10px}.float-btn{width:45px;height:45px;border-radius:50%;border:none;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:all 0.3s ease;box-shadow:0 3px 10px rgba(0,0,0,0.3);background:#e74c3c;color:white}.float-btn:hover{transform:scale(1.15)}@media(max-width:768px){.modern-pdf-wrap{margin:10px auto;border-radius:8px}.modern-pdf-frame{height:450px}.float-btn{width:40px;height:40px;font-size:16px}}@media(max-width:480px){.modern-pdf-wrap{width:100%;margin:5px auto;border-radius:0}.modern-pdf-frame{height:400px}.float-btn{width:36px;height:36px;font-size:14px}}</style><div class="modern-pdf-wrap"><div class="floating-controls"><button class="float-btn" onclick="refreshPDF()" title="Refresh">↻</button><button class="float-btn" onclick="fullscreenPDF()" title="Fullscreen">⛶</button></div><iframe id="modernPdfViewer" class="modern-pdf-frame" src="https://docs.google.com/viewer?url=${{ steps.pdf.outputs.url }}&embedded=true" allowfullscreen></iframe></div><script>function fullscreenPDF(){var el=document.getElementById("modernPdfViewer");if(el.requestFullscreen){el.requestFullscreen()}else if(el.webkitRequestFullscreen){el.webkitRequestFullscreen()}else if(el.msRequestFullscreen){el.msRequestFullscreen()}}function refreshPDF(){var el=document.getElementById("modernPdfViewer");el.src=el.src}</script>'
+          
+          curl -X POST \
+            "https://www.googleapis.com/blogger/v3/blogs/${{ secrets.BLOGGER_BLOG_ID }}/posts/" \
+            -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"kind\": \"blogger#post\",
+              \"title\": \"${{ steps.pdf.outputs.name }}\",
+              \"content\": \"$POST_CONTENT\"
+            }"
