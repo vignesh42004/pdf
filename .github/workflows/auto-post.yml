@@ -26,38 +26,57 @@ jobs:
           PDF_FILE=""
           OLD_FILE=""
           
-          ADDED=$(git diff --name-status HEAD~1 HEAD | grep -E '^A\s.*\.pdf$' | head -1 | awk '{print $2}')
-          if [ -n "$ADDED" ]; then
-            ACTION="add"
-            PDF_FILE="$ADDED"
-            echo "Detected new file: $PDF_FILE"
+          # Get all changes into a temp file for processing
+          git diff --name-status HEAD~1 HEAD > /tmp/changes.txt
+          
+          # Check for Renamed files first (R followed by number)
+          RENAMED_LINE=$(grep -E '^R[0-9]+' /tmp/changes.txt | grep -i '\.pdf' | head -1)
+          if [ -n "$RENAMED_LINE" ]; then
+            ACTION="rename"
+            # Extract old and new filenames (tab-separated)
+            OLD_FILE=$(echo "$RENAMED_LINE" | sed 's/^R[0-9]*\t//' | cut -f1)
+            PDF_FILE=$(echo "$RENAMED_LINE" | sed 's/^R[0-9]*\t//' | cut -f2)
+            echo "Detected rename: '$OLD_FILE' -> '$PDF_FILE'"
           fi
           
-          if [ -z "$PDF_FILE" ]; then
-            MODIFIED=$(git diff --name-status HEAD~1 HEAD | grep -E '^M\s.*\.pdf$' | head -1 | awk '{print $2}')
-            if [ -n "$MODIFIED" ]; then
+          # Check for Added files
+          if [ -z "$ACTION" ]; then
+            ADDED_LINE=$(grep -E '^A\t' /tmp/changes.txt | grep -i '\.pdf$' | head -1)
+            if [ -n "$ADDED_LINE" ]; then
+              # Check if there's also a delete (D+A = rename via web interface)
+              DELETED_LINE=$(grep -E '^D\t' /tmp/changes.txt | grep -i '\.pdf$' | head -1)
+              
+              if [ -n "$DELETED_LINE" ]; then
+                # This is a rename done via web interface (shows as D + A)
+                ACTION="rename"
+                OLD_FILE=$(echo "$DELETED_LINE" | sed 's/^D\t//')
+                PDF_FILE=$(echo "$ADDED_LINE" | sed 's/^A\t//')
+                echo "Detected rename (D+A): '$OLD_FILE' -> '$PDF_FILE'"
+              else
+                ACTION="add"
+                PDF_FILE=$(echo "$ADDED_LINE" | sed 's/^A\t//')
+                echo "Detected new file: '$PDF_FILE'"
+              fi
+            fi
+          fi
+          
+          # Check for Modified files
+          if [ -z "$ACTION" ]; then
+            MODIFIED_LINE=$(grep -E '^M\t' /tmp/changes.txt | grep -i '\.pdf$' | head -1)
+            if [ -n "$MODIFIED_LINE" ]; then
               ACTION="modify"
-              PDF_FILE="$MODIFIED"
-              echo "Detected modified file: $PDF_FILE"
+              PDF_FILE=$(echo "$MODIFIED_LINE" | sed 's/^M\t//')
+              echo "Detected modified file: '$PDF_FILE'"
             fi
           fi
           
-          if [ -z "$PDF_FILE" ]; then
-            RENAMED=$(git diff --name-status HEAD~1 HEAD | grep -E '^R[0-9]+\s.*\.pdf' | head -1)
-            if [ -n "$RENAMED" ]; then
-              ACTION="rename"
-              OLD_FILE=$(echo "$RENAMED" | awk '{print $2}')
-              PDF_FILE=$(echo "$RENAMED" | awk '{print $3}')
-              echo "Detected rename: $OLD_FILE -> $PDF_FILE"
-            fi
-          fi
-          
-          if [ -z "$PDF_FILE" ]; then
-            DELETED=$(git diff --name-status HEAD~1 HEAD | grep -E '^D\s.*\.pdf$' | head -1 | awk '{print $2}')
-            if [ -n "$DELETED" ]; then
+          # Check for Deleted files only (no corresponding add)
+          if [ -z "$ACTION" ]; then
+            DELETED_LINE=$(grep -E '^D\t' /tmp/changes.txt | grep -i '\.pdf$' | head -1)
+            if [ -n "$DELETED_LINE" ]; then
               ACTION="delete"
-              OLD_FILE="$DELETED"
-              echo "Detected deleted file: $OLD_FILE"
+              OLD_FILE=$(echo "$DELETED_LINE" | sed 's/^D\t//')
+              echo "Detected deleted file: '$OLD_FILE'"
             fi
           fi
           
@@ -67,64 +86,85 @@ jobs:
           echo "OLD_FILE: $OLD_FILE"
           echo "=========================================="
           
+          # Exit if no PDF changes
           if [ -z "$ACTION" ]; then
             echo "No PDF changes found"
             echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
           
-          if [ "$ACTION" != "delete" ] && [ ! -f "$PDF_FILE" ]; then
-            echo "PDF file doesn't exist: $PDF_FILE"
-            echo "skip=true" >> $GITHUB_OUTPUT
-            exit 0
+          # For add/modify/rename, verify file exists
+          if [ "$ACTION" != "delete" ]; then
+            if [ ! -f "$PDF_FILE" ]; then
+              echo "❌ PDF file doesn't exist: '$PDF_FILE'"
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              echo "✅ File exists: '$PDF_FILE'"
+            fi
           fi
           
+          # Get PDF name and URL
           if [ -n "$PDF_FILE" ]; then
             PDF_NAME=$(basename "$PDF_FILE" .pdf)
-            PDF_URL_PATH=$(echo "$PDF_FILE" | sed 's/ /%20/g' | sed 's/#/%23/g')
+            # URL encode the path
+            PDF_URL_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$PDF_FILE'''))")
             PDF_URL="https://raw.githubusercontent.com/${{ github.repository }}/main/${PDF_URL_PATH}"
+            
             echo "url=$PDF_URL" >> $GITHUB_OUTPUT
             echo "name=$PDF_NAME" >> $GITHUB_OUTPUT
-            echo "file=$PDF_FILE" >> $GITHUB_OUTPUT
+            
+            # Use base64 to safely pass filename with spaces
+            FILE_B64=$(echo -n "$PDF_FILE" | base64 -w 0)
+            echo "file_b64=$FILE_B64" >> $GITHUB_OUTPUT
+          fi
+          
+          if [ -n "$OLD_FILE" ]; then
+            OLD_FILE_B64=$(echo -n "$OLD_FILE" | base64 -w 0)
+            echo "old_file_b64=$OLD_FILE_B64" >> $GITHUB_OUTPUT
           fi
           
           echo "action=$ACTION" >> $GITHUB_OUTPUT
-          echo "old_file=$OLD_FILE" >> $GITHUB_OUTPUT
           echo "skip=false" >> $GITHUB_OUTPUT
-
-      - name: Debug - Check outputs
-        run: |
-          echo "========== Step Outputs =========="
-          echo "skip: ${{ steps.pdf.outputs.skip }}"
-          echo "action: ${{ steps.pdf.outputs.action }}"
-          echo "file: ${{ steps.pdf.outputs.file }}"
-          echo "name: ${{ steps.pdf.outputs.name }}"
-          echo "url: ${{ steps.pdf.outputs.url }}"
+          
+          echo "========== Final Output =========="
+          echo "URL: $PDF_URL"
+          echo "Name: $PDF_NAME"
           echo "=================================="
+
+      - name: Decode filenames
+        if: steps.pdf.outputs.skip != 'true'
+        id: decode
+        run: |
+          # Decode base64 filenames
+          if [ -n "${{ steps.pdf.outputs.file_b64 }}" ]; then
+            PDF_FILE=$(echo "${{ steps.pdf.outputs.file_b64 }}" | base64 -d)
+            echo "file=$PDF_FILE" >> $GITHUB_OUTPUT
+            echo "Decoded file: $PDF_FILE"
+          fi
+          
+          if [ -n "${{ steps.pdf.outputs.old_file_b64 }}" ]; then
+            OLD_FILE=$(echo "${{ steps.pdf.outputs.old_file_b64 }}" | base64 -d)
+            echo "old_file=$OLD_FILE" >> $GITHUB_OUTPUT
+            echo "Decoded old_file: $OLD_FILE"
+          fi
 
       - name: Get Access Token
         if: steps.pdf.outputs.skip != 'true'
         id: token
         run: |
-          echo "Requesting access token..."
-          
           RESPONSE=$(curl -s -X POST https://oauth2.googleapis.com/token \
             -d "client_id=${{ secrets.BLOGGER_CLIENT_ID }}" \
             -d "client_secret=${{ secrets.BLOGGER_CLIENT_SECRET }}" \
             -d "refresh_token=${{ secrets.BLOGGER_REFRESH_TOKEN }}" \
             -d "grant_type=refresh_token")
           
-          echo "========== DEBUG: Token Response =========="
-          echo "$RESPONSE" | jq '.'
-          echo "============================================"
-          
           ACCESS_TOKEN=$(echo $RESPONSE | jq -r '.access_token')
           ERROR=$(echo $RESPONSE | jq -r '.error // empty')
-          ERROR_DESC=$(echo $RESPONSE | jq -r '.error_description // empty')
           
           if [ -n "$ERROR" ]; then
             echo "❌ OAuth Error: $ERROR"
-            echo "❌ Description: $ERROR_DESC"
+            echo "$RESPONSE" | jq '.'
             exit 1
           fi
           
@@ -133,36 +173,8 @@ jobs:
             exit 1
           fi
           
-          echo "✅ Got access token (length: ${#ACCESS_TOKEN})"
+          echo "✅ Got access token"
           echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
-
-      - name: Test Blogger API Connection
-        if: steps.pdf.outputs.skip != 'true'
-        run: |
-          echo "Testing Blogger API connection..."
-          
-          RESPONSE=$(curl -s -X GET \
-            "https://www.googleapis.com/blogger/v3/blogs/${{ secrets.BLOGGER_BLOG_ID }}" \
-            -H "Authorization: Bearer ${{ steps.token.outputs.token }}")
-          
-          echo "========== DEBUG: Blog Info =========="
-          echo "$RESPONSE" | jq '.'
-          echo "======================================"
-          
-          BLOG_NAME=$(echo $RESPONSE | jq -r '.name // empty')
-          ERROR=$(echo $RESPONSE | jq -r '.error.message // empty')
-          
-          if [ -n "$ERROR" ]; then
-            echo "❌ API Error: $ERROR"
-            exit 1
-          fi
-          
-          if [ -n "$BLOG_NAME" ]; then
-            echo "✅ Connected to blog: $BLOG_NAME"
-          else
-            echo "❌ Could not get blog info"
-            exit 1
-          fi
 
       - name: Load tracking data
         if: steps.pdf.outputs.skip != 'true'
@@ -170,6 +182,7 @@ jobs:
           if [ ! -f "pdf_posts.json" ]; then
             echo '{}' > pdf_posts.json
           fi
+          echo "Current tracking:"
           cat pdf_posts.json
 
       - name: Find existing post ID
@@ -179,15 +192,17 @@ jobs:
           ACTION="${{ steps.pdf.outputs.action }}"
           
           if [ "$ACTION" == "rename" ] || [ "$ACTION" == "delete" ]; then
-            LOOKUP_FILE="${{ steps.pdf.outputs.old_file }}"
+            LOOKUP_FILE="${{ steps.decode.outputs.old_file }}"
           else
-            LOOKUP_FILE="${{ steps.pdf.outputs.file }}"
+            LOOKUP_FILE="${{ steps.decode.outputs.file }}"
           fi
           
-          POST_ID=$(cat pdf_posts.json | jq -r --arg file "$LOOKUP_FILE" '.[$file] // empty')
+          echo "Looking up: '$LOOKUP_FILE'"
+          
+          POST_ID=$(jq -r --arg file "$LOOKUP_FILE" '.[$file] // empty' pdf_posts.json)
           
           if [ -n "$POST_ID" ] && [ "$POST_ID" != "null" ]; then
-            echo "Found existing post ID: $POST_ID"
+            echo "✅ Found existing post ID: $POST_ID"
             echo "post_id=$POST_ID" >> $GITHUB_OUTPUT
             echo "exists=true" >> $GITHUB_OUTPUT
           else
@@ -198,37 +213,28 @@ jobs:
       - name: Generate post content
         if: steps.pdf.outputs.skip != 'true' && steps.pdf.outputs.action != 'delete'
         run: |
-          cat > content.html << 'HTMLEOF'
-          <div style="background: rgb(255, 248, 225); border-radius: 8px; border: 1px solid rgb(255, 204, 2); color: #6d5c00; font-size: 13px; margin: 15px 0px; padding: 15px;"><strong>📄 Document Disclaimer:</strong> This PDF is shared for educational purposes only. We do not own the copyright. If you are the owner and want it removed, please contact us.</div><blockquote style="background: #f0f7ff; border-left: 4px solid #3498db; margin: 15px 0; padding: 12px 15px; border-radius: 0 8px 8px 0;"><p style="margin: 0;"><strong>💡 Pro Tip:</strong> Use Refresh button if not visible and try full screen mode for better view.</p></blockquote><style>.modern-pdf-wrap{position:relative;max-width:900px;margin:20px auto;border-radius:12px;overflow:hidden;box-shadow:0 5px 25px rgba(0,0,0,0.2);width:95%}.modern-pdf-frame{width:100%;height:620px;border:none;display:block}.floating-controls{position:absolute;top:15px;right:15px;z-index:100;display:flex;gap:10px}.float-btn{width:45px;height:45px;border-radius:50%;border:none;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:all 0.3s ease;box-shadow:0 3px 10px rgba(0,0,0,0.3);color:white}.float-btn:hover{transform:scale(1.15)}.refresh-btn{background:#3498db}.fullscreen-btn{background:#27ae60}.download-btn{background:#9b59b6;text-decoration:none}@media(max-width:768px){.modern-pdf-wrap{margin:10px auto;border-radius:8px}.modern-pdf-frame{height:450px}.float-btn{width:40px;height:40px;font-size:16px}}@media(max-width:480px){.modern-pdf-wrap{width:100%;margin:5px auto;border-radius:0}.modern-pdf-frame{height:400px}.float-btn{width:36px;height:36px;font-size:14px}}</style><div class="modern-pdf-wrap"><div class="floating-controls"><button class="float-btn refresh-btn" onclick="refreshPDF()" title="Refresh">↻</button><button class="float-btn fullscreen-btn" onclick="fullscreenPDF()" title="Fullscreen">⛶</button><a class="float-btn download-btn" href="URL_PLACEHOLDER" target="_blank" download title="Download">⬇</a></div><iframe id="modernPdfViewer" class="modern-pdf-frame" src="https://docs.google.com/viewer?url=URL_PLACEHOLDER&embedded=true" allowfullscreen></iframe></div><script>function fullscreenPDF(){var el=document.getElementById("modernPdfViewer");if(el.requestFullscreen){el.requestFullscreen()}else if(el.webkitRequestFullscreen){el.webkitRequestFullscreen()}else if(el.msRequestFullscreen){el.msRequestFullscreen()}}function refreshPDF(){var el=document.getElementById("modernPdfViewer");el.src=el.src}</script>
+          PDF_URL="${{ steps.pdf.outputs.url }}"
+          
+          cat > content.html << HTMLEOF
+          <div style="background: rgb(255, 248, 225); border-radius: 8px; border: 1px solid rgb(255, 204, 2); color: #6d5c00; font-size: 13px; margin: 15px 0px; padding: 15px;"><strong>📄 Document Disclaimer:</strong> This PDF is shared for educational purposes only. We do not own the copyright. If you are the owner and want it removed, please contact us.</div><blockquote style="background: #f0f7ff; border-left: 4px solid #3498db; margin: 15px 0; padding: 12px 15px; border-radius: 0 8px 8px 0;"><p style="margin: 0;"><strong>💡 Pro Tip:</strong> Use Refresh button if not visible and try full screen mode for better view.</p></blockquote><style>.modern-pdf-wrap{position:relative;max-width:900px;margin:20px auto;border-radius:12px;overflow:hidden;box-shadow:0 5px 25px rgba(0,0,0,0.2);width:95%}.modern-pdf-frame{width:100%;height:620px;border:none;display:block}.floating-controls{position:absolute;top:15px;right:15px;z-index:100;display:flex;gap:10px}.float-btn{width:45px;height:45px;border-radius:50%;border:none;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:all 0.3s ease;box-shadow:0 3px 10px rgba(0,0,0,0.3);color:white}.float-btn:hover{transform:scale(1.15)}.refresh-btn{background:#3498db}.fullscreen-btn{background:#27ae60}.download-btn{background:#9b59b6;text-decoration:none}@media(max-width:768px){.modern-pdf-wrap{margin:10px auto;border-radius:8px}.modern-pdf-frame{height:450px}.float-btn{width:40px;height:40px;font-size:16px}}@media(max-width:480px){.modern-pdf-wrap{width:100%;margin:5px auto;border-radius:0}.modern-pdf-frame{height:400px}.float-btn{width:36px;height:36px;font-size:14px}}</style><div class="modern-pdf-wrap"><div class="floating-controls"><button class="float-btn refresh-btn" onclick="refreshPDF()" title="Refresh">↻</button><button class="float-btn fullscreen-btn" onclick="fullscreenPDF()" title="Fullscreen">⛶</button><a class="float-btn download-btn" href="${PDF_URL}" target="_blank" download title="Download">⬇</a></div><iframe id="modernPdfViewer" class="modern-pdf-frame" src="https://docs.google.com/viewer?url=${PDF_URL}&embedded=true" allowfullscreen></iframe></div><script>function fullscreenPDF(){var el=document.getElementById("modernPdfViewer");if(el.requestFullscreen){el.requestFullscreen()}else if(el.webkitRequestFullscreen){el.webkitRequestFullscreen()}else if(el.msRequestFullscreen){el.msRequestFullscreen()}}function refreshPDF(){var el=document.getElementById("modernPdfViewer");el.src=el.src}</script>
           HTMLEOF
           
-          sed -i "s|URL_PLACEHOLDER|${{ steps.pdf.outputs.url }}|g" content.html
-          
-          echo "========== DEBUG: Content Preview =========="
-          head -c 500 content.html
-          echo ""
-          echo "============================================="
+          echo "✅ Content generated"
+          echo "PDF URL: $PDF_URL"
 
       - name: Create new post
         if: steps.pdf.outputs.skip != 'true' && steps.pdf.outputs.action == 'add' && steps.find_post.outputs.exists != 'true'
         id: create
         run: |
-          echo "Creating new blog post..."
+          echo "📝 Creating new blog post..."
           echo "Title: ${{ steps.pdf.outputs.name }}"
           
-          # Read content and create JSON properly
           CONTENT=$(cat content.html)
           
-          # Create JSON using jq for proper escaping
           jq -n \
             --arg title "${{ steps.pdf.outputs.name }}" \
             --arg content "$CONTENT" \
             '{kind: "blogger#post", title: $title, content: $content}' > post.json
-          
-          echo "========== DEBUG: Post JSON =========="
-          cat post.json | head -c 1000
-          echo ""
-          echo "======================================"
           
           RESPONSE=$(curl -s -X POST \
             "https://www.googleapis.com/blogger/v3/blogs/${{ secrets.BLOGGER_BLOG_ID }}/posts/" \
@@ -236,29 +242,23 @@ jobs:
             -H "Content-Type: application/json" \
             -d @post.json)
           
-          echo "========== DEBUG: Blogger Response =========="
-          echo "$RESPONSE" | jq '.'
-          echo "=============================================="
-          
           POST_ID=$(echo $RESPONSE | jq -r '.id // empty')
           POST_URL=$(echo $RESPONSE | jq -r '.url // empty')
           ERROR=$(echo $RESPONSE | jq -r '.error.message // empty')
           
           if [ -n "$ERROR" ]; then
-            echo "❌ Blogger API Error: $ERROR"
-            echo "success=false" >> $GITHUB_OUTPUT
+            echo "❌ Error: $ERROR"
+            echo "$RESPONSE" | jq '.'
             exit 1
           fi
           
           if [ -n "$POST_ID" ]; then
-            echo "✅ Created new post!"
-            echo "   Post ID: $POST_ID"
-            echo "   URL: $POST_URL"
+            echo "✅ Created: $POST_URL"
             echo "post_id=$POST_ID" >> $GITHUB_OUTPUT
             echo "success=true" >> $GITHUB_OUTPUT
           else
-            echo "❌ Failed to create post - no ID returned"
-            echo "success=false" >> $GITHUB_OUTPUT
+            echo "❌ Failed - Response:"
+            echo "$RESPONSE" | jq '.'
             exit 1
           fi
 
@@ -266,7 +266,7 @@ jobs:
         if: steps.pdf.outputs.skip != 'true' && (steps.pdf.outputs.action == 'rename' || steps.pdf.outputs.action == 'modify') && steps.find_post.outputs.exists == 'true'
         id: update
         run: |
-          echo "Updating existing blog post..."
+          echo "📝 Updating existing post..."
           
           POST_ID="${{ steps.find_post.outputs.post_id }}"
           CONTENT=$(cat content.html)
@@ -283,25 +283,22 @@ jobs:
             -H "Content-Type: application/json" \
             -d @post.json)
           
-          echo "========== DEBUG: Update Response =========="
-          echo "$RESPONSE" | jq '.'
-          echo "============================================="
-          
           UPDATED_ID=$(echo $RESPONSE | jq -r '.id // empty')
+          POST_URL=$(echo $RESPONSE | jq -r '.url // empty')
           
           if [ -n "$UPDATED_ID" ]; then
-            echo "✅ Updated post"
+            echo "✅ Updated: $POST_URL"
             echo "success=true" >> $GITHUB_OUTPUT
           else
-            echo "❌ Failed to update"
-            echo "success=false" >> $GITHUB_OUTPUT
+            echo "❌ Failed - Response:"
+            echo "$RESPONSE" | jq '.'
           fi
 
-      - name: Create post for renamed file
+      - name: Create post for renamed file (if no existing post)
         if: steps.pdf.outputs.skip != 'true' && steps.pdf.outputs.action == 'rename' && steps.find_post.outputs.exists != 'true'
         id: create_renamed
         run: |
-          echo "Creating post for renamed file..."
+          echo "📝 Creating post for renamed file (no existing post found)..."
           
           CONTENT=$(cat content.html)
           
@@ -316,61 +313,69 @@ jobs:
             -H "Content-Type: application/json" \
             -d @post.json)
           
-          echo "========== DEBUG: Response =========="
-          echo "$RESPONSE" | jq '.'
-          echo "======================================"
-          
           POST_ID=$(echo $RESPONSE | jq -r '.id // empty')
+          POST_URL=$(echo $RESPONSE | jq -r '.url // empty')
           
           if [ -n "$POST_ID" ]; then
-            echo "✅ Created post: $POST_ID"
+            echo "✅ Created: $POST_URL"
             echo "post_id=$POST_ID" >> $GITHUB_OUTPUT
             echo "success=true" >> $GITHUB_OUTPUT
           else
-            echo "❌ Failed"
-            echo "success=false" >> $GITHUB_OUTPUT
+            echo "❌ Failed - Response:"
+            echo "$RESPONSE" | jq '.'
           fi
 
       - name: Update tracking file
         if: steps.pdf.outputs.skip != 'true'
         run: |
           ACTION="${{ steps.pdf.outputs.action }}"
-          FILE="${{ steps.pdf.outputs.file }}"
-          OLD_FILE="${{ steps.pdf.outputs.old_file }}"
+          FILE="${{ steps.decode.outputs.file }}"
+          OLD_FILE="${{ steps.decode.outputs.old_file }}"
           
+          # Get the post ID
           NEW_POST_ID=""
-          if [ "${{ steps.create.outputs.post_id }}" != "" ]; then
+          if [ -n "${{ steps.create.outputs.post_id }}" ]; then
             NEW_POST_ID="${{ steps.create.outputs.post_id }}"
-          elif [ "${{ steps.create_renamed.outputs.post_id }}" != "" ]; then
+          elif [ -n "${{ steps.create_renamed.outputs.post_id }}" ]; then
             NEW_POST_ID="${{ steps.create_renamed.outputs.post_id }}"
-          elif [ "${{ steps.find_post.outputs.post_id }}" != "" ]; then
+          elif [ -n "${{ steps.find_post.outputs.post_id }}" ]; then
             NEW_POST_ID="${{ steps.find_post.outputs.post_id }}"
           fi
           
-          echo "Action: $ACTION | File: $FILE | Post ID: $NEW_POST_ID"
+          echo "Action: $ACTION"
+          echo "File: $FILE"
+          echo "Old File: $OLD_FILE"
+          echo "Post ID: $NEW_POST_ID"
           
           case $ACTION in
             "add")
-              if [ -n "$NEW_POST_ID" ]; then
+              if [ -n "$NEW_POST_ID" ] && [ -n "$FILE" ]; then
                 jq --arg file "$FILE" --arg id "$NEW_POST_ID" '. + {($file): $id}' pdf_posts.json > tmp.json && mv tmp.json pdf_posts.json
+                echo "✅ Added to tracking: $FILE"
               fi
               ;;
             "rename")
+              # Remove old entry
               if [ -n "$OLD_FILE" ]; then
                 jq --arg file "$OLD_FILE" 'del(.[$file])' pdf_posts.json > tmp.json && mv tmp.json pdf_posts.json
+                echo "🗑️ Removed old tracking: $OLD_FILE"
               fi
+              # Add new entry
               if [ -n "$NEW_POST_ID" ] && [ -n "$FILE" ]; then
                 jq --arg file "$FILE" --arg id "$NEW_POST_ID" '. + {($file): $id}' pdf_posts.json > tmp.json && mv tmp.json pdf_posts.json
+                echo "✅ Added new tracking: $FILE"
               fi
               ;;
             "delete")
               if [ -n "$OLD_FILE" ]; then
                 jq --arg file "$OLD_FILE" 'del(.[$file])' pdf_posts.json > tmp.json && mv tmp.json pdf_posts.json
+                echo "🗑️ Removed tracking: $OLD_FILE"
               fi
               ;;
           esac
           
-          echo "Final tracking file:"
+          echo ""
+          echo "📋 Final tracking file:"
           cat pdf_posts.json
 
       - name: Commit tracking file
